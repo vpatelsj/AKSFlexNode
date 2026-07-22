@@ -41,6 +41,7 @@ def prepare_args(**overrides):
         "agent_pool_name": "aksflexnodes",
         "controller_version": None,
         "controller_manifest_url": None,
+        "release_repository": "example/AKSFlexNode",
         "skip_controller_install": False,
         "variant": "cloud-init",
         "output": "-",
@@ -139,7 +140,11 @@ class ConfigTests(unittest.TestCase):
 
     def test_bootstrap_script_verifies_checksum_and_preserves_secret_config(self):
         node_config = {"azure": {"bootstrapToken": {"token": "abcdef.0123456789abcdef"}}}
-        script = config.render_bootstrap_script(node_config, "v0.1.5-rc.1")
+        script = config.render_bootstrap_script(
+            node_config,
+            "v0.1.5-rc.1",
+            "example/AKSFlexNode",
+        )
         self.assertIn("sha256sum --check --strict", script)
         self.assertIn("umask 077", script)
         self.assertIn('chmod 0600 "${config_tmp}"', script)
@@ -148,6 +153,11 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("umask 022", script)
         self.assertIn("already converged", script)
         self.assertIn("refusing an in-place overwrite", script)
+        self.assertIn(
+            'release_url="https://github.com/${release_repository}/releases/download/${version}"',
+            script,
+        )
+        self.assertIn("readonly release_repository='example/AKSFlexNode'", script)
         encoded = script.split("printf '%s' '", 1)[1].split("' | base64", 1)[0]
         self.assertEqual(json.loads(base64.b64decode(encoded)), node_config)
 
@@ -169,6 +179,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.validate_node_name("flex-node-1"), "flex-node-1")
         self.assertEqual(config.validate_ip_address("10.0.0.4"), "10.0.0.4")
         self.assertEqual(config.validate_release_version("v0.1.5-rc.1"), "v0.1.5-rc.1")
+        self.assertEqual(config.validate_github_repository("example/AKSFlexNode"), "example/AKSFlexNode")
         with self.assertRaises(argparse.ArgumentTypeError):
             config.validate_node_name("Flex_Node")
         with self.assertRaises(argparse.ArgumentTypeError):
@@ -177,6 +188,8 @@ class ConfigTests(unittest.TestCase):
             config.validate_ip_address("not-an-ip")
         with self.assertRaises(argparse.ArgumentTypeError):
             config.validate_release_version("latest")
+        with self.assertRaises(argparse.ArgumentTypeError):
+            config.validate_github_repository("missing-owner")
 
     def test_prepare_node_orchestrates_cluster_and_payload(self):
         args = prepare_args()
@@ -209,7 +222,11 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(require_command.call_count, 2)
         load_kubeconfig.assert_called_once_with(args)
         run.assert_called_once_with(["kubectl", "apply", "-f", "-"], input_text=config.RBAC_MANIFEST)
-        ensure_controller.assert_called_once_with("v0.1.5-rc.1", None)
+        ensure_controller.assert_called_once_with(
+            "v0.1.5-rc.1",
+            None,
+            "example/AKSFlexNode",
+        )
         ensure_goal.assert_called_once()
         payload, output_path = write_output.call_args.args
         self.assertTrue(payload.startswith("#cloud-config\n"))
@@ -220,12 +237,19 @@ class ConfigTests(unittest.TestCase):
             aks_flex_node_version="v0.1.5-rc.1",
             git_commit="abcdef123456",
             controller_digest="sha256:" + "1" * 64,
+            controller_image="ghcr.io/example/aks-flex-controller",
+            release_repository="example/AKSFlexNode",
             unbounded_version="v0.1.24-rc.9",
         )
         bom = config.render_release_bom(args)
         self.assertEqual(bom["release"]["tag"], "v0.1.5-rc.1")
         self.assertEqual(bom["unboundedModuleVersion"], "v0.1.24-rc.9")
         self.assertEqual(bom["controllerImage"]["digest"], "sha256:" + "1" * 64)
+        self.assertEqual(
+            bom["controllerImage"]["reference"],
+            "ghcr.io/example/aks-flex-controller:v0.1.5-rc.1",
+        )
+        self.assertEqual(bom["release"]["repository"], "example/AKSFlexNode")
         self.assertIn("aks-flex-config", bom["artifacts"])
         self.assertIn("aks-flex-controller-v0.1.5-rc.1.yaml", bom["artifacts"])
         self.assertEqual(

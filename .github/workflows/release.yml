@@ -15,7 +15,7 @@ permissions:
 
 env:
   RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-  CONTROLLER_IMAGE: ghcr.io/azure/aks-flex-controller
+  CONTROLLER_IMAGE: ghcr.io/${{ github.repository_owner }}/aks-flex-controller
 
 jobs:
   build:
@@ -99,6 +99,9 @@ jobs:
       - name: Resolve release commit
         id: metadata
         run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Normalize controller image
+        run: echo "CONTROLLER_IMAGE=${CONTROLLER_IMAGE,,}" >> "$GITHUB_ENV"
 
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
         with:
@@ -187,6 +190,9 @@ jobs:
             exit 1
           fi
 
+      - name: Normalize controller image
+        run: echo "CONTROLLER_IMAGE=${CONTROLLER_IMAGE,,}" >> "$GITHUB_ENV"
+
       - name: Download artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -229,6 +235,8 @@ jobs:
             --aks-flex-node-version "${RELEASE_VERSION}" \
             --git-commit "${release_commit}" \
             --controller-digest "${{ needs.controller-image.outputs.digest }}" \
+            --controller-image "${CONTROLLER_IMAGE}" \
+            --release-repository "${GITHUB_REPOSITORY}" \
             --unbounded-version "${unbounded_version}" \
             --output "release-assets/aks-flex-node-release-bom-${RELEASE_VERSION}.json"
 
@@ -267,7 +275,7 @@ jobs:
 
           **Quick install (Ubuntu 22.04/24.04):**
           \`\`\`bash
-          curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${RELEASE_VERSION}/scripts/install.sh | sudo bash
+          curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${RELEASE_VERSION}/scripts/install.sh | sudo env AKS_FLEX_NODE_REPOSITORY="${GITHUB_REPOSITORY}" bash
           \`\`\`
 
           **Manual installation:**

@@ -25,9 +25,15 @@ DEFAULT_RUNC_VERSION = "1.1.12"
 DEFAULT_CNI_VERSION = "1.5.1"
 DEFAULT_NPD_VERSION = "v1.35.1"
 DEFAULT_OCI_IMAGE = "ghcr.io/azure/agent-ubuntu2404:v20260619"
+DEFAULT_RELEASE_REPOSITORY = os.environ.get("AKS_FLEX_NODE_REPOSITORY", "Azure/AKSFlexNode")
+DEFAULT_CONTROLLER_IMAGE = os.environ.get(
+    "AKS_FLEX_CONTROLLER_IMAGE",
+    f"ghcr.io/{DEFAULT_RELEASE_REPOSITORY.split('/', 1)[0].lower()}/aks-flex-controller",
+)
 CONTROLLER_SERVICE_PROXY_PATH = "/api/v1/namespaces/kube-system/services/http:aks-flex-controller:80/proxy"
 NODE_NAME_PATTERN = re.compile(r"^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$")
 NODE_NAME_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
+GITHUB_REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 def log_info(message: str) -> None:
@@ -296,6 +302,13 @@ def validate_release_version(value: str) -> str:
     return value
 
 
+def validate_github_repository(value: str) -> str:
+    value = value.strip()
+    if not GITHUB_REPOSITORY_PATTERN.fullmatch(value):
+        raise argparse.ArgumentTypeError("GitHub repository must use owner/name form")
+    return value
+
+
 def bootstrap_cluster_data(args: argparse.Namespace) -> dict[str, str]:
     token = generate_bootstrap_token(args)
     server_url = run(
@@ -417,15 +430,19 @@ def ensure_machine_goal(args: argparse.Namespace, metadata: dict[str, str]) -> N
     )
 
 
-def controller_manifest_url(version: str) -> str:
+def controller_manifest_url(version: str, repository: str = DEFAULT_RELEASE_REPOSITORY) -> str:
     return (
-        "https://github.com/Azure/AKSFlexNode/releases/download/"
+        f"https://github.com/{repository}/releases/download/"
         f"{version}/aks-flex-controller-{version}.yaml"
     )
 
 
-def ensure_flex_controller(version: str, manifest_url: str | None = None) -> None:
-    manifest = manifest_url or controller_manifest_url(version)
+def ensure_flex_controller(
+    version: str,
+    manifest_url: str | None = None,
+    repository: str = DEFAULT_RELEASE_REPOSITORY,
+) -> None:
+    manifest = manifest_url or controller_manifest_url(version, repository)
     run(["kubectl", "apply", "-f", manifest])
     run(
         [
@@ -441,7 +458,11 @@ def ensure_flex_controller(version: str, manifest_url: str | None = None) -> Non
     run(["kubectl", "get", "--raw", f"{CONTROLLER_SERVICE_PROXY_PATH}/healthz"], capture=True)
 
 
-def render_bootstrap_script(config: dict[str, object], version: str) -> str:
+def render_bootstrap_script(
+    config: dict[str, object],
+    version: str,
+    repository: str = DEFAULT_RELEASE_REPOSITORY,
+) -> str:
     rendered_config = (json.dumps(config, indent=2) + "\n").encode()
     config_data = base64.b64encode(rendered_config).decode()
     config_checksum = hashlib.sha256(rendered_config).hexdigest()
@@ -454,6 +475,7 @@ if [[ $(id -u) -ne 0 ]]; then
 fi
 
 readonly version={version!r}
+readonly release_repository={repository!r}
 readonly expected_config_checksum={config_checksum!r}
 
 if systemctl is-active --quiet aks-flex-node-agent.service; then
@@ -474,7 +496,7 @@ case $(uname -m) in
 esac
 
 readonly asset="aks-flex-node-linux-${{arch}}.tar.gz"
-readonly release_url="https://github.com/Azure/AKSFlexNode/releases/download/${{version}}"
+readonly release_url="https://github.com/${{release_repository}}/releases/download/${{version}}"
 work_dir=$(mktemp -d)
 trap 'rm -rf "${{work_dir}}"' EXIT
 
@@ -542,7 +564,11 @@ def prepare_node(args: argparse.Namespace) -> None:
 
     controller_version = args.controller_version or args.aks_flex_node_version
     if not args.skip_controller_install:
-        ensure_flex_controller(controller_version, args.controller_manifest_url)
+        ensure_flex_controller(
+            controller_version,
+            args.controller_manifest_url,
+            args.release_repository,
+        )
 
     metadata = cluster_metadata(args)
     metadata["agent_pool_name"] = agent_pool_name(args)
@@ -550,7 +576,11 @@ def prepare_node(args: argparse.Namespace) -> None:
     config = render_bootstrap_config(args, metadata, cluster_data)
     ensure_machine_goal(args, metadata)
 
-    script = render_bootstrap_script(config, args.aks_flex_node_version)
+    script = render_bootstrap_script(
+        config,
+        args.aks_flex_node_version,
+        args.release_repository,
+    )
     output = render_cloud_init(script) if args.variant == "cloud-init" else script
     write_sensitive_text(output, args.output)
 
@@ -572,11 +602,15 @@ def render_release_bom(args: argparse.Namespace) -> dict[str, object]:
     ]
     return {
         "schemaVersion": 1,
-        "release": {"tag": version, "gitCommit": args.git_commit},
+        "release": {
+            "tag": version,
+            "gitCommit": args.git_commit,
+            "repository": args.release_repository,
+        },
         "artifacts": artifacts,
         "unboundedModuleVersion": args.unbounded_version,
         "controllerImage": {
-            "reference": f"ghcr.io/azure/aks-flex-controller:{version}",
+            "reference": f"{args.controller_image}:{version}",
             "digest": args.controller_digest,
             "platforms": ["linux/amd64", "linux/arm64"],
         },
@@ -636,6 +670,12 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--node-name", required=True, type=validate_node_name)
     prepare.add_argument("--node-ip", required=True, type=validate_ip_address)
     prepare.add_argument("--aks-flex-node-version", required=True, type=validate_release_version)
+    prepare.add_argument(
+        "--release-repository",
+        default=DEFAULT_RELEASE_REPOSITORY,
+        type=validate_github_repository,
+        help=f"GitHub repository containing release assets (default: {DEFAULT_RELEASE_REPOSITORY}).",
+    )
     prepare.add_argument("--controller-version", type=validate_release_version)
     prepare.add_argument("--controller-manifest-url")
     prepare.add_argument("--skip-controller-install", action="store_true")
@@ -654,6 +694,12 @@ def build_parser() -> argparse.ArgumentParser:
     bom.add_argument("--aks-flex-node-version", required=True, type=validate_release_version)
     bom.add_argument("--git-commit", required=True)
     bom.add_argument("--controller-digest", required=True)
+    bom.add_argument("--controller-image", default=DEFAULT_CONTROLLER_IMAGE)
+    bom.add_argument(
+        "--release-repository",
+        default=DEFAULT_RELEASE_REPOSITORY,
+        type=validate_github_repository,
+    )
     bom.add_argument("--unbounded-version", required=True)
     bom.add_argument("--output", required=True)
     bom.set_defaults(func=generate_release_bom)

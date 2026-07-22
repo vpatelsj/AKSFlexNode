@@ -12,7 +12,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-REPO="Azure/AKSFlexNode"
+REPO="${AKS_FLEX_NODE_REPOSITORY:-Azure/AKSFlexNode}"
 SERVICE_NAME="aks-flex-node"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/aks-flex-node"
