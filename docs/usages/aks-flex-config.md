@@ -2,7 +2,7 @@
 
 `scripts/aks-flex-config` is a workstation-side helper for generating AKS Flex Node config files from AKS cluster metadata.
 
-The helper does not install anything on the target host. It uses Azure CLI and, for bootstrap-token mode, `kubectl` to prepare cluster-side bootstrap material and render a config that can be copied to the host.
+The helper uses Azure CLI and `kubectl` to prepare cluster-side bootstrap material. It can render a standalone config for manual installation or a complete checksum-verified shell/cloud-init payload for a released AKS Flex Node version.
 
 ## Prerequisites
 
@@ -34,6 +34,55 @@ AGENT_POOL_NAME="${AGENT_POOL_NAME:-aksflexnodes}"
 | `--resource-group` | yes | Resource group that contains the AKS cluster. |
 | `--cluster-name` | yes | AKS cluster name. |
 | `--subscription` | no | Azure subscription ID or name. Defaults to the current Azure CLI account subscription. |
+
+## Prepare And Bootstrap A Node
+
+`prepare-node` is the release-oriented bootstrap-token workflow. It:
+
+1. Loads AKS admin credentials and applies AKS Flex Node bootstrap RBAC.
+2. Installs the version-pinned in-cluster Flex Controller and waits for it.
+3. Creates a 24-hour bootstrap token and publishes the node's machine goal.
+4. Emits a shell script or cloud-init document containing the node config.
+5. Makes the target verify the released agent archive checksum, install required host packages, run preflight, and start the agent.
+
+Generate cloud-init before creating an Ubuntu 22.04 or 24.04 VM:
+
+```bash
+AKS_FLEX_NODE_VERSION="<release-tag>"
+NODE_NAME="flex-node-1"
+NODE_PRIVATE_IP="10.92.1.4"
+
+./aks-flex-config prepare-node \
+  --resource-group "$RESOURCE_GROUP" \
+  --cluster-name "$CLUSTER_NAME" \
+  --subscription "$SUBSCRIPTION_ID" \
+  --agent-pool-name "$AGENT_POOL_NAME" \
+  --node-name "$NODE_NAME" \
+  --node-ip "$NODE_PRIVATE_IP" \
+  --aks-flex-node-version "$AKS_FLEX_NODE_VERSION" \
+  --variant cloud-init \
+  --output ./aks-flex-node-cloud-init.yaml
+```
+
+Pass the resulting file as VM custom data. For an already-running host, select `--variant script` and run the output as root:
+
+```bash
+./aks-flex-config prepare-node \
+  --resource-group "$RESOURCE_GROUP" \
+  --cluster-name "$CLUSTER_NAME" \
+  --subscription "$SUBSCRIPTION_ID" \
+  --node-name "$NODE_NAME" \
+  --node-ip "$NODE_PRIVATE_IP" \
+  --aks-flex-node-version "$AKS_FLEX_NODE_VERSION" \
+  --variant script \
+  --output ./aks-flex-node-bootstrap.sh
+
+sudo bash ./aks-flex-node-bootstrap.sh
+```
+
+Both output variants contain a bootstrap token and are written with mode `0600`. Delete the local payload after provisioning. The token expires after 24 hours. Use `--controller-manifest-url` for a trusted mirror, or `--skip-controller-install` only when the matching controller is already installed.
+
+The command pins the tested runtime defaults. Override `--oci-image`, `--containerd-version`, `--runc-version`, `--cni-version`, or `--npd-version` only as a coordinated compatibility change.
 
 ## Setup Node RBAC
 

@@ -22,7 +22,7 @@ spec:
             - --listen-address=:8080
             - --machine-configmap-namespace=kube-system
             - --machine-configmap-name=aks-flex-machines
-            - --enable-csr-approver=false
+            - --enable-csr-approver=true
           ports:
             - name: http
               containerPort: 8080

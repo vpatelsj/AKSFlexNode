@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import ipaddress
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -16,6 +20,14 @@ from urllib.parse import urlsplit
 
 RESOURCE_MANAGER_ENDPOINT = "https://management.azure.com"
 DEFAULT_AGENT_POOL_NAME = "aksflexnodes"
+DEFAULT_CONTAINERD_VERSION = "2.0.4"
+DEFAULT_RUNC_VERSION = "1.1.12"
+DEFAULT_CNI_VERSION = "1.5.1"
+DEFAULT_NPD_VERSION = "v1.35.1"
+DEFAULT_OCI_IMAGE = "ghcr.io/azure/agent-ubuntu2404:v20260619"
+CONTROLLER_SERVICE_PROXY_PATH = "/api/v1/namespaces/kube-system/services/http:aks-flex-controller:80/proxy"
+NODE_NAME_PATTERN = re.compile(r"^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$")
+NODE_NAME_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
 
 
 def log_info(message: str) -> None:
@@ -256,6 +268,333 @@ def generate_node_config(args: argparse.Namespace) -> None:
     write_config(config, args.output)
 
 
+def validate_node_name(value: str) -> str:
+    value = value.strip()
+    if not value or len(value) > 253 or not NODE_NAME_PATTERN.fullmatch(value):
+        raise argparse.ArgumentTypeError("node name must be a lowercase Kubernetes DNS subdomain")
+    if any(
+        len(label) > 63 or not NODE_NAME_LABEL_PATTERN.fullmatch(label)
+        for label in value.split(".")
+    ):
+        raise argparse.ArgumentTypeError(
+            "node name labels must contain 1-63 lowercase alphanumeric or hyphen characters"
+        )
+    return value
+
+
+def validate_ip_address(value: str) -> str:
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError as err:
+        raise argparse.ArgumentTypeError(f"invalid node IP address: {value}") from err
+
+
+def validate_release_version(value: str) -> str:
+    value = value.strip()
+    if not re.fullmatch(r"v[0-9A-Za-z][0-9A-Za-z._-]*", value):
+        raise argparse.ArgumentTypeError("release version must start with v and contain only letters, numbers, ., _, or -")
+    return value
+
+
+def bootstrap_cluster_data(args: argparse.Namespace) -> dict[str, str]:
+    token = generate_bootstrap_token(args)
+    server_url = run(
+        ["kubectl", "config", "view", "--minify", "-o", "jsonpath={.clusters[0].cluster.server}"],
+        capture=True,
+    )
+    ca_cert_data = run(
+        [
+            "kubectl",
+            "config",
+            "view",
+            "--minify",
+            "--raw",
+            "-o",
+            "jsonpath={.clusters[0].cluster.certificate-authority-data}",
+        ],
+        capture=True,
+    )
+    return {"token": token, "server_url": server_url, "ca_cert_data": ca_cert_data}
+
+
+def render_bootstrap_config(
+    args: argparse.Namespace,
+    metadata: dict[str, str],
+    cluster_data: dict[str, str],
+) -> dict[str, object]:
+    config: dict[str, object] = {
+        "azure": {
+            "subscriptionId": metadata["subscription_id"],
+            "tenantId": metadata["tenant_id"],
+            "resourceManagerEndpoint": RESOURCE_MANAGER_ENDPOINT,
+            "targetAgentPoolName": metadata["agent_pool_name"],
+            "bootstrapToken": {"token": cluster_data["token"]},
+            "arc": {"enabled": False},
+            "targetCluster": {
+                "resourceId": metadata["resource_id"],
+                "location": metadata["location"],
+            },
+        },
+        "agent": {
+            "logLevel": args.log_level,
+            "logDir": "/var/log/aks-flex-node",
+            "nodeName": args.node_name,
+            "machineClient": {
+                "mode": "in-cluster",
+                "endpointUrl": CONTROLLER_SERVICE_PROXY_PATH,
+            },
+            "requireMachineRegistration": True,
+        },
+        "bootstrap": {"ociImage": args.oci_image},
+        "components": {
+            "kubernetes": metadata["kubernetes_version"],
+            "containerd": args.containerd_version,
+            "runc": args.runc_version,
+        },
+        "networking": {
+            "dnsServiceIP": metadata["dns_service_ip"],
+            "cniVersion": args.cni_version,
+        },
+        "node": {
+            "labels": {"kubernetes.azure.com/managed": "false"},
+            "kubelet": {
+                "clusterFQDN": cluster_fqdn_from_server_url(cluster_data["server_url"]),
+                "caCertData": cluster_data["ca_cert_data"],
+                "nodeIP": args.node_ip,
+            },
+        },
+        "npd": {"version": args.npd_version},
+    }
+    return config
+
+
+def render_machine_goal(args: argparse.Namespace, metadata: dict[str, str]) -> dict[str, object]:
+    machine_id = (
+        f"{metadata['resource_id'].rstrip('/')}/agentPools/{metadata['agent_pool_name']}"
+        f"/machines/{args.node_name}"
+    )
+    return {
+        "id": machine_id,
+        "name": args.node_name,
+        "type": "Microsoft.ContainerService/managedClusters/agentPools/machines",
+        "properties": {
+            "eTag": f"{args.aks_flex_node_version}-{metadata['kubernetes_version']}",
+            "provisioningState": "Succeeded",
+            "kubernetes": {
+                "orchestratorVersion": metadata["kubernetes_version"],
+                "maxPods": 110,
+                "nodeLabels": {"kubernetes.azure.com/managed": "false"},
+                "nodeTaints": [],
+                "kubeletConfig": {
+                    "imageGcHighThreshold": 85,
+                    "imageGcLowThreshold": 80,
+                },
+            },
+        },
+    }
+
+
+def ensure_machine_goal(args: argparse.Namespace, metadata: dict[str, str]) -> None:
+    try:
+        run(["kubectl", "-n", "kube-system", "get", "configmap", "aks-flex-machines"], capture=True)
+    except subprocess.CalledProcessError:
+        run(["kubectl", "-n", "kube-system", "create", "configmap", "aks-flex-machines"])
+
+    machine = json.dumps(render_machine_goal(args, metadata), separators=(",", ":"))
+    patch = json.dumps({"data": {f"{args.node_name}.json": machine}})
+    run(
+        [
+            "kubectl",
+            "-n",
+            "kube-system",
+            "patch",
+            "configmap",
+            "aks-flex-machines",
+            "--type=merge",
+            "-p",
+            patch,
+        ]
+    )
+
+
+def controller_manifest_url(version: str) -> str:
+    return (
+        "https://github.com/Azure/AKSFlexNode/releases/download/"
+        f"{version}/aks-flex-controller-{version}.yaml"
+    )
+
+
+def ensure_flex_controller(version: str, manifest_url: str | None = None) -> None:
+    manifest = manifest_url or controller_manifest_url(version)
+    run(["kubectl", "apply", "-f", manifest])
+    run(
+        [
+            "kubectl",
+            "-n",
+            "kube-system",
+            "rollout",
+            "status",
+            "deployment/aks-flex-controller",
+            "--timeout=5m",
+        ]
+    )
+    run(["kubectl", "get", "--raw", f"{CONTROLLER_SERVICE_PROXY_PATH}/healthz"], capture=True)
+
+
+def render_bootstrap_script(config: dict[str, object], version: str) -> str:
+    rendered_config = (json.dumps(config, indent=2) + "\n").encode()
+    config_data = base64.b64encode(rendered_config).decode()
+    config_checksum = hashlib.sha256(rendered_config).hexdigest()
+    return f"""#!/bin/bash
+set -euo pipefail
+
+if [[ $(id -u) -ne 0 ]]; then
+  echo "AKS Flex Node bootstrap must run as root" >&2
+  exit 1
+fi
+
+readonly version={version!r}
+readonly expected_config_checksum={config_checksum!r}
+
+if systemctl is-active --quiet aks-flex-node-agent.service; then
+    installed_version=$(/usr/local/bin/aks-flex-node version 2>/dev/null | awk '$1 == "Version:" {{print $2}}')
+    installed_config_checksum=$(sha256sum /etc/aks-flex-node/config.json 2>/dev/null | awk '{{print $1}}')
+    if [[ "${{installed_version}}" == "${{version}}" && "${{installed_config_checksum}}" == "${{expected_config_checksum}}" ]]; then
+        echo "aks-flex-node-agent.service is already converged"
+        exit 0
+    fi
+    echo "aks-flex-node-agent.service is active with an unexpected binary or config; refusing an in-place overwrite" >&2
+    exit 1
+fi
+
+case $(uname -m) in
+  x86_64) arch=amd64 ;;
+  aarch64) arch=arm64 ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+readonly asset="aks-flex-node-linux-${{arch}}.tar.gz"
+readonly release_url="https://github.com/Azure/AKSFlexNode/releases/download/${{version}}"
+work_dir=$(mktemp -d)
+trap 'rm -rf "${{work_dir}}"' EXIT
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates curl systemd-container nftables util-linux
+
+curl -fsSLo "${{work_dir}}/checksums.txt" "${{release_url}}/checksums.txt"
+curl -fsSLo "${{work_dir}}/${{asset}}" "${{release_url}}/${{asset}}"
+expected=$(awk -v name="${{asset}}" '$2 == name {{print $1}}' "${{work_dir}}/checksums.txt")
+if [[ -z "${{expected}}" ]]; then
+  echo "checksum for ${{asset}} is missing" >&2
+  exit 1
+fi
+printf '%s  %s\n' "${{expected}}" "${{work_dir}}/${{asset}}" | sha256sum --check --strict
+
+tar -xzf "${{work_dir}}/${{asset}}" -C "${{work_dir}}"
+install -o root -g root -m 0755 "${{work_dir}}/aks-flex-node-linux-${{arch}}" /usr/local/bin/aks-flex-node
+install -d -o root -g root -m 0755 /etc/aks-flex-node /var/lib/aks-flex-node /var/log/aks-flex-node
+umask 077
+config_tmp=$(mktemp /etc/aks-flex-node/config.json.XXXXXX)
+printf '%s' {config_data!r} | base64 --decode > "${{config_tmp}}"
+chmod 0600 "${{config_tmp}}"
+mv -f "${{config_tmp}}" /etc/aks-flex-node/config.json
+
+/usr/local/bin/aks-flex-node preflight --config /etc/aks-flex-node/config.json
+umask 022
+/usr/local/bin/aks-flex-node start --config /etc/aks-flex-node/config.json
+"""
+
+
+def render_cloud_init(script: str) -> str:
+    encoded = base64.b64encode(script.encode()).decode()
+    return f"""#cloud-config
+write_files:
+  - path: /usr/local/sbin/aks-flex-node-bootstrap
+    owner: root:root
+    permissions: "0700"
+    encoding: b64
+    content: {encoded}
+runcmd:
+  - [bash, /usr/local/sbin/aks-flex-node-bootstrap]
+"""
+
+
+def write_sensitive_text(content: str, output: str) -> None:
+    if output == "-":
+        print(content, end="")
+        return
+    path = Path(output)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    path.chmod(0o600)
+    log_info(f"wrote {path}")
+
+
+def prepare_node(args: argparse.Namespace) -> None:
+    require_command("az")
+    require_command("kubectl")
+    load_admin_kubeconfig(args)
+    run(["kubectl", "apply", "-f", "-"], input_text=RBAC_MANIFEST)
+
+    controller_version = args.controller_version or args.aks_flex_node_version
+    if not args.skip_controller_install:
+        ensure_flex_controller(controller_version, args.controller_manifest_url)
+
+    metadata = cluster_metadata(args)
+    metadata["agent_pool_name"] = agent_pool_name(args)
+    cluster_data = bootstrap_cluster_data(args)
+    config = render_bootstrap_config(args, metadata, cluster_data)
+    ensure_machine_goal(args, metadata)
+
+    script = render_bootstrap_script(config, args.aks_flex_node_version)
+    output = render_cloud_init(script) if args.variant == "cloud-init" else script
+    write_sensitive_text(output, args.output)
+
+
+def render_release_bom(args: argparse.Namespace) -> dict[str, object]:
+    version = args.aks_flex_node_version
+    artifacts = [
+        "aks-flex-config",
+        f"aks-flex-controller-{version}.yaml",
+        f"aks-flex-controller-{version}.yaml.bundle.json",
+        "aks-flex-node-linux-amd64.tar.gz",
+        "aks-flex-node-linux-amd64.tar.gz.spdx.json",
+        "aks-flex-node-linux-arm64.tar.gz",
+        "aks-flex-node-linux-arm64.tar.gz.spdx.json",
+        "checksums.txt",
+        "checksums.txt.bundle.json",
+        f"aks-flex-node-release-bom-{version}.json",
+        f"aks-flex-node-release-bom-{version}.json.bundle.json",
+    ]
+    return {
+        "schemaVersion": 1,
+        "release": {"tag": version, "gitCommit": args.git_commit},
+        "artifacts": artifacts,
+        "unboundedModuleVersion": args.unbounded_version,
+        "controllerImage": {
+            "reference": f"ghcr.io/azure/aks-flex-controller:{version}",
+            "digest": args.controller_digest,
+            "platforms": ["linux/amd64", "linux/arm64"],
+        },
+        "nodeBootstrapDefaults": {
+            "kubernetesVersionSource": "AKS control plane version",
+            "containerdVersion": DEFAULT_CONTAINERD_VERSION,
+            "runcVersion": DEFAULT_RUNC_VERSION,
+            "cniPluginVersion": DEFAULT_CNI_VERSION,
+            "nodeProblemDetectorVersion": DEFAULT_NPD_VERSION,
+            "rootfsImage": DEFAULT_OCI_IMAGE,
+        },
+    }
+
+
+def generate_release_bom(args: argparse.Namespace) -> None:
+    write_config(render_release_bom(args), args.output)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Prepare AKS Flex Node configuration.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -288,6 +627,36 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--arc-location")
     generate.add_argument("--output", default="-")
     generate.set_defaults(func=generate_node_config)
+
+    prepare = subparsers.add_parser(
+        "prepare-node",
+        help="Prepare cluster state and render a checksum-verified node bootstrap payload.",
+    )
+    add_cluster_args(prepare)
+    prepare.add_argument("--node-name", required=True, type=validate_node_name)
+    prepare.add_argument("--node-ip", required=True, type=validate_ip_address)
+    prepare.add_argument("--aks-flex-node-version", required=True, type=validate_release_version)
+    prepare.add_argument("--controller-version", type=validate_release_version)
+    prepare.add_argument("--controller-manifest-url")
+    prepare.add_argument("--skip-controller-install", action="store_true")
+    prepare.add_argument("--agent-pool-name", default=DEFAULT_AGENT_POOL_NAME)
+    prepare.add_argument("--containerd-version", default=DEFAULT_CONTAINERD_VERSION)
+    prepare.add_argument("--runc-version", default=DEFAULT_RUNC_VERSION)
+    prepare.add_argument("--cni-version", default=DEFAULT_CNI_VERSION)
+    prepare.add_argument("--npd-version", default=DEFAULT_NPD_VERSION)
+    prepare.add_argument("--oci-image", default=DEFAULT_OCI_IMAGE)
+    prepare.add_argument("--log-level", choices=["debug", "info", "warning", "error"], default="info")
+    prepare.add_argument("--variant", choices=["script", "cloud-init"], default="cloud-init")
+    prepare.add_argument("--output", default="-")
+    prepare.set_defaults(func=prepare_node)
+
+    bom = subparsers.add_parser("release-bom", help="Render the AKS Flex Node release bill of materials.")
+    bom.add_argument("--aks-flex-node-version", required=True, type=validate_release_version)
+    bom.add_argument("--git-commit", required=True)
+    bom.add_argument("--controller-digest", required=True)
+    bom.add_argument("--unbounded-version", required=True)
+    bom.add_argument("--output", required=True)
+    bom.set_defaults(func=generate_release_bom)
 
     return parser
 

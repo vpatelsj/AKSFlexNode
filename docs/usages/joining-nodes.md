@@ -14,7 +14,9 @@ This guide summarizes the supported ways to join a virtual machine or bare metal
 
 Bootstrap token mode is the recommended quickstart path. It uses Kubernetes TLS bootstrapping and does not require Azure credentials on the host after the config is rendered.
 
-High-level flow:
+For a new VM, prefer `aks-flex-config prepare-node`. It installs the matching in-cluster controller, publishes the machine goal, and emits checksum-verified cloud-init or a shell payload. See [AKS Flex Config Helper](aks-flex-config.md#prepare-and-bootstrap-a-node).
+
+The lower-level manual flow remains available:
 
 1. Run [`scripts/aks-flex-config setup-node-rbac`](../../scripts/aks-flex-config) to setup required node bootstrap RBAC permissions.
 2. Run `scripts/aks-flex-config generate-node-config --bootstrap-token` to create a bootstrap token, fetch AKS cluster metadata, and render the host config.
