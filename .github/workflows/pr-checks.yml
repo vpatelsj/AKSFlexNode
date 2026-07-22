@@ -56,7 +56,10 @@ jobs:
           cache: true
 
       - name: Run tests
-        run: go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+        run: |
+          python3 -m unittest scripts/test_aks_flex_config.py
+          bash scripts/test_install.sh
+          go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
 
       - name: Generate coverage report
         run: go tool cover -html=coverage.out -o coverage.html

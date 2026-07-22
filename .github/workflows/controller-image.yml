@@ -2,14 +2,17 @@ name: AKS Flex Controller Image
 
 on:
   push:
+    branches:
+      - main
     tags:
-      - "v*"
       - "controller-*"
   workflow_dispatch:
 
 permissions:
   contents: read
   packages: write
+  id-token: write
+  attestations: write
 
 env:
   IMAGE_PACKAGE: aks-flex-controller
@@ -31,6 +34,9 @@ jobs:
           set -euo pipefail
           docker buildx create --name aks-flex-builder --use
           docker buildx inspect --bootstrap
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
@@ -92,3 +98,32 @@ jobs:
           fi
 
           docker buildx build "${build_args[@]}" .
+
+          if [[ "${PUSH_IMAGE}" == "true" ]]; then
+            digest="$(docker buildx imagetools inspect "${image}:sha-${short_sha}" | awk '$1 == "Digest:" {print $2; exit}')"
+            if [[ -z "${digest}" ]]; then
+              echo "could not resolve controller image digest" >&2
+              exit 1
+            fi
+            cosign sign --yes "${image}@${digest}"
+            echo "CONTROLLER_IMAGE_REF=${image}@${digest}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Generate controller image SBOM
+        if: env.CONTROLLER_IMAGE_REF != ''
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.CONTROLLER_IMAGE_REF }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          format: spdx-json
+          artifact-name: sbom-aks-flex-controller.spdx.json
+          output-file: sbom-aks-flex-controller.spdx.json
+
+      - name: Attest controller image SBOM
+        if: env.CONTROLLER_IMAGE_REF != ''
+        run: |
+          cosign attest --yes \
+            --predicate sbom-aks-flex-controller.spdx.json \
+            --type spdxjson \
+            "${CONTROLLER_IMAGE_REF}"

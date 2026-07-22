@@ -12,7 +12,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-REPO="Azure/AKSFlexNode"
+REPO="${AKS_FLEX_NODE_REPOSITORY:-Azure/AKSFlexNode}"
 SERVICE_NAME="aks-flex-node"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/aks-flex-node"
@@ -26,6 +26,9 @@ AKS_FLEX_NODE_VERSION="${AKS_FLEX_NODE_VERSION:-}"
 # Full release archive URL; bypasses the default GitHub URL layout.
 # Set AKS_FLEX_NODE_VERSION with it to avoid the GitHub latest-release API lookup.
 AKS_FLEX_NODE_DOWNLOAD_URL="${AKS_FLEX_NODE_DOWNLOAD_URL:-}"
+# Checksums URL for release archive verification. Custom mirrors can override
+# this while preserving the standard checksums.txt format.
+AKS_FLEX_NODE_CHECKSUMS_URL="${AKS_FLEX_NODE_CHECKSUMS_URL:-}"
 LOCAL_BINARY_PATH="${AKS_FLEX_NODE_LOCAL_BINARY:-}"
 SKIP_AZCLI="${SKIP_AZCLI:-false}"
 
@@ -239,6 +242,29 @@ download_binary() {
         log_error "Neither curl nor wget is available. Please install one of them."
         exit 1
     fi
+
+    local checksums_url="${AKS_FLEX_NODE_CHECKSUMS_URL:-https://github.com/${REPO}/releases/download/${version}/checksums.txt}"
+    local checksums_file="${temp_dir}/checksums.txt"
+    if ! download_file "$checksums_url" "$checksums_file"; then
+        log_error "Failed to download release checksums"
+        rm -rf "$temp_dir"
+        exit 1
+    fi
+
+    local expected_checksum actual_checksum
+    expected_checksum=$(awk -v name="$archive_name" '$2 == name {print $1}' "$checksums_file")
+    if [[ -z "$expected_checksum" ]]; then
+        log_error "Checksum for $archive_name was not found in checksums.txt"
+        rm -rf "$temp_dir"
+        exit 1
+    fi
+    actual_checksum=$(sha256sum "$archive_name" | awk '{print $1}')
+    if [[ "$actual_checksum" != "$expected_checksum" ]]; then
+        log_error "Checksum verification failed for $archive_name"
+        rm -rf "$temp_dir"
+        exit 1
+    fi
+    log_success "Verified checksum for $archive_name" >&2
 
     log_info "Extracting binary..." >&2
     tar -xzf "$archive_name"
@@ -591,5 +617,7 @@ main() {
     show_next_steps
 }
 
-# Run main function
-main "$@"
+# Run main function when executed, but remain sourceable for focused tests.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

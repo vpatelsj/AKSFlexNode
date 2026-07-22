@@ -73,6 +73,8 @@ You should see your existing cluster nodes in `Ready` state.
 
 **Run on: your workstation**
 
+For a new VM, the released helper can combine controller setup, machine-goal publication, config generation, checksum verification, preflight, and startup into cloud-init or a shell payload. See [`prepare-node`](docs/usages/aks-flex-config.md#prepare-and-bootstrap-a-node). The steps below show the lower-level manual flow.
+
 Download the helper, apply the node bootstrap RBAC bindings, and generate a bootstrap-token config from your cluster's metadata.
 
 ```bash

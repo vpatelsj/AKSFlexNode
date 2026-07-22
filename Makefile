@@ -54,6 +54,8 @@ package-all: package-linux-amd64 package-linux-arm64
 .PHONY: test
 test:
 	@echo "Running tests..."
+	@python3 -m unittest scripts/test_aks_flex_config.py
+	@bash scripts/test_install.sh
 	@go test -v ./...
 
 .PHONY: test-coverage
